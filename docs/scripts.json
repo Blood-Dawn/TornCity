@@ -1,0 +1,13 @@
+{
+  "scripts": [
+    {
+      "name": "Torn High-Low Brain",
+      "category": "Casino",
+      "game": "High-Low",
+      "version": "3.0.0",
+      "description": "Probability overlay + suggests High/Low; optional hide-worst mode.",
+      "greasyfork": "TODO_AFTER_PUBLISH",
+      "repo_path": "userscripts/casino/highlow/torn-highlow-brain.user.js"
+    }
+  ]
+}
