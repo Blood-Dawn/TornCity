@@ -6,7 +6,7 @@
       "game": "High-Low",
       "version": "3.0.0",
       "description": "Probability overlay + suggests High/Low; optional hide-worst mode.",
-      "greasyfork": "TODO_AFTER_PUBLISH",
+      "greasyfork": "https://greasyfork.org/en/scripts/566026-torn-high-low-helper-bloodawn-profit-merit",
       "repo_path": "userscripts/casino/highlow/torn-highlow-brain.user.js"
     }
   ]
