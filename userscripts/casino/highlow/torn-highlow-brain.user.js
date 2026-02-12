@@ -1,5 +1,5 @@
 // ==UserScript==
-// @name         Torn High-Low Brain (Bloodawn) - Profit + Merit (Upgraded)
+// @name         Torn High-Low Brain - Profit + Merit (Upgraded)
 // @namespace    https://github.com/Blood-Dawn/TornCity
 // @version      3.1.0
 // @description  Probability overlay + best-pick logic using tracked deck; tie-aware; auto shuffle handling; optional hide-worst.
