@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         Torn High-Low Brain - Profit + Merit (Upgraded)
+// @name         Torn High-Low Brain (Bloodawn) - Profit + Merit (DOM Fix)
 // @namespace    https://github.com/Blood-Dawn/TornCity
-// @version      3.1.0
-// @description  Probability overlay + best-pick logic using tracked deck; tie-aware; auto shuffle handling; optional hide-worst.
+// @version      3.1.2
+// @description  Probability overlay + suggests High/Low using tracked deck; robust button detection; optional hide-worst; shuffle/desync reset.
 // @author       Bloodawn
 // @match        https://www.torn.com/page.php?sid=highlow*
 // @grant        none
@@ -12,47 +12,46 @@
 /**
  * (Bloodawn)
  * File: torn-highlow-brain.user.js
- * Purpose: High-Low probability overlay + decision engine (profit + merit) with persistent deck tracking.
+ * Purpose: High-Low probability overlay + suggestion engine (profit + merit), robust DOM selectors.
  */
-
-
 
 (function () {
   "use strict";
 
   /********************
-   * Constants & Config
+   * Storage keys
    ********************/
-  const LS_SETTINGS = "bloodawn_highlow_settings_v1";
-  const LS_STATE = "bloodawn_highlow_state_v1";
+  const LS_SETTINGS = "bloodawn_highlow_settings_v2";
+  const LS_STATE = "bloodawn_highlow_state_v2";
 
+  /********************
+   * Card mapping
+   ********************/
   const CARD_VALUES = { "2": 2, "3": 3, "4": 4, "5": 5, "6": 6, "7": 7, "8": 8, "9": 9, "10": 10, "J": 11, "Q": 12, "K": 13, "A": 14 };
   const VALUE_TO_RANK = Object.fromEntries(Object.entries(CARD_VALUES).map(([k, v]) => [v, k]));
 
-  // Torn High-Low reshuffles after 16 full rounds (32 cards seen). Keep it configurable anyway.
+  /********************
+   * Defaults
+   ********************/
   const DEFAULTS = {
     overlayEnabled: true,
     hideWorstEnabled: true,
-    mode: "profit", // "profit" | "merit"
+    mode: "profit", // profit | merit
+    lookaheadTieBreaker: true,
+    // Resets
     autoResetOnShuffleText: true,
     autoResetOnCardLimit: true,
-    cardLimit: 32,
-    // IMPORTANT: deck persists across games; do NOT reset on loss by default.
-    resetOnLoss: false,
-    // Advanced decision upgrades
-    lookaheadTieBreaker: true,
-    monteCarloEnabled: false,     // optional heavy mode for close calls
-    mcRollouts: 1200,
-    mcHorizon: 4,
-    mcTriggerEdge: 0.03,          // run MC if |pHigh - pLow| < 3 percentage points
+    cardLimit: 32,              // conservative reshuffle heuristic
+    autoResetOnLoss: false,     // optional (toggle with Alt+L)
     // UI
     overlayScale: 1.0,
   };
 
   const settings = loadSettings();
-
-  // State persisted so you can refresh the page without losing your shoe tracking.
   const state = loadState();
+
+  // Keeps the last computed decision visible on results screens
+  let lastDecisionModel = null;
 
   /********************
    * DOM helpers
@@ -64,6 +63,23 @@
     if (!txt) return null;
     const t = String(txt).trim().toUpperCase();
     return CARD_VALUES[t] ?? null;
+  }
+
+  function getCardTextFromCardEl(cardEl) {
+    if (!cardEl) return "";
+    // primary
+    const rating = cardEl.querySelector("span.rating");
+    if (rating && rating.textContent != null) {
+      const t = rating.textContent.trim();
+      if (t) return t;
+    }
+    // fallback: find any leaf text that matches a rank
+    const leaves = $all("*", cardEl).filter(n => n.childElementCount === 0 && n.textContent);
+    for (const n of leaves) {
+      const t = n.textContent.trim().toUpperCase();
+      if (t in CARD_VALUES) return t;
+    }
+    return "";
   }
 
   function parseMoney(str) {
@@ -81,33 +97,79 @@
     return Number(m[1]) / 100;
   }
 
-  // Best-effort: tries to locate pot + modifier text without hardcoding a brittle selector.
   function readPotAndModifier(container) {
-    const textBlobs = $all("*", container).map(n => (n && n.childElementCount === 0 ? n.textContent : "")).filter(Boolean);
+    // best-effort scraping
+    const textBlobs = $all("*", container)
+      .filter(n => n.childElementCount === 0 && n.textContent)
+      .map(n => n.textContent)
+      .filter(Boolean);
 
-    // Pot often has a $.
     let pot = null;
     for (const t of textBlobs) {
-      if (t.includes("$")) { pot = parseMoney(t); if (pot !== null) break; }
+      if (t.includes("$")) { pot = parseMoney(t); if (pot != null) break; }
     }
 
-    // Modifier often appears like "23%" somewhere.
     let mod = null;
     for (const t of textBlobs) {
-      if (t.includes("%")) { mod = parsePercent(t); if (mod !== null && mod > 0 && mod < 1) break; }
+      if (t.includes("%")) { mod = parsePercent(t); if (mod != null && mod > 0 && mod < 1) break; }
     }
 
     return { pot, mod };
   }
 
   /********************
+   * Robust action button detection
+   ********************/
+  function findHighLowButtons(container) {
+    const actions = $(".actions-wrap", container) || container;
+
+    // 1) try known class patterns
+    let lowWrap = $(".action-btn-wrap.low", actions) || $(".action-btn-wrap.lower", actions);
+    let highWrap = $(".action-btn-wrap.high", actions) || $(".action-btn-wrap.higher", actions);
+
+    // 2) scan action button wrappers by text
+    if (!lowWrap || !highWrap) {
+      const wraps = $all(".action-btn-wrap", actions);
+      for (const w of wraps) {
+        const t = (w.textContent || "").trim().toLowerCase();
+        if (!lowWrap && (t === "low" || t.includes("lower"))) lowWrap = w;
+        if (!highWrap && (t === "high" || t.includes("higher"))) highWrap = w;
+      }
+    }
+
+    // 3) fallback: scan actual buttons/links by text (some layouts skip wrapper classes)
+    if (!lowWrap || !highWrap) {
+      const clicks = $all("button,a", actions);
+      for (const b of clicks) {
+        const t = (b.textContent || "").trim().toLowerCase();
+        if (!lowWrap && (t === "low" || t.includes("lower"))) lowWrap = b;
+        if (!highWrap && (t === "high" || t.includes("higher"))) highWrap = b;
+      }
+    }
+
+    return { low: lowWrap, high: highWrap };
+  }
+
+  /********************
    * Deck tracking
    ********************/
   function freshCounts() {
-    // index 0..14, we use 2..14
     const counts = new Uint8Array(15);
     for (let v = 2; v <= 14; v++) counts[v] = 4;
     return counts;
+  }
+
+  function saveState() {
+    try {
+      localStorage.setItem(LS_STATE, JSON.stringify({
+        counts: Array.from(state.counts || []),
+        cardsSeen: state.cardsSeen || 0,
+        deckKnown: !!state.deckKnown,
+        tieIsPush: !!state.tieIsPush,
+        lastDealer: state.lastDealer ?? null,
+        lastPlayer: state.lastPlayer ?? null,
+      }));
+    } catch {}
   }
 
   function resetDeck(reason) {
@@ -116,11 +178,8 @@
     state.deckKnown = true;
     state.lastDealer = null;
     state.lastPlayer = null;
-    state.lastPot = null;
-    state.tieIsPush = true; // default based on community understanding; still auto-validated.
-    state.lastOutcome = "reset:" + reason;
     saveState();
-    flash(`Deck reset (${reason})`);
+    flash(`Reset: ${reason}`);
   }
 
   function consumeCard(v) {
@@ -128,11 +187,9 @@
     if (!state.counts || state.counts.length !== 15) state.counts = freshCounts();
 
     if (state.counts[v] === 0) {
-      // Desync: you "saw" a 5th copy. Mark unknown; keep operating but warn.
       state.deckKnown = false;
-      state.lastOutcome = "desync";
       saveState();
-      flash(`Desync: saw extra ${VALUE_TO_RANK[v]}. Tracking marked UNKNOWN.`);
+      flash(`Desync: extra ${VALUE_TO_RANK[v]} seen. Alt+R to reset.`);
       return false;
     }
 
@@ -155,36 +212,13 @@
     return { lower, higher, equal, total };
   }
 
-  function topRanks(filterFn, limit = 3) {
-    const arr = [];
-    for (let v = 2; v <= 14; v++) {
-      const n = state.counts[v] || 0;
-      if (n <= 0) continue;
-      if (filterFn && !filterFn(v)) continue;
-      arr.push({ v, n });
-    }
-    arr.sort((a, b) => b.n - a.n || b.v - a.v);
-    return arr.slice(0, limit).map(x => `${VALUE_TO_RANK[x.v]}(${x.n})`).join(", ");
-  }
-
   /********************
    * Decision engine
    ********************/
-  function oneStepLookaheadBestAction(dealerValue) {
-    // Tie case only: higher == lower, so immediate pWin ties.
-    // We break ties by looking at the expected next-hand "best immediate win chance" assuming you win this hand.
-    const { lower, higher, total } = countsRelativeTo(dealerValue);
-    if (total <= 0) return "HIGH";
-    if (higher !== lower) return higher > lower ? "HIGH" : "LOW";
-
-    const eHigh = expectedNextEdgeIfWin(dealerValue, true);
-    const eLow = expectedNextEdgeIfWin(dealerValue, false);
-    return (eHigh >= eLow) ? "HIGH" : "LOW";
-  }
-
   function expectedNextEdgeIfWin(dealerValue, chooseHigh) {
     const c = state.counts;
     let winTotal = 0;
+
     for (let v = 2; v <= 14; v++) {
       const n = c[v] || 0;
       if (!n) continue;
@@ -198,120 +232,32 @@
       if (!n) continue;
       if (!(chooseHigh ? (v > dealerValue) : (v < dealerValue))) continue;
 
-      // simulate removing that next dealer card
       c[v]--;
-      const { lower, higher, equal } = countsRelativeTo(v);
+      const rel = countsRelativeTo(v);
       c[v]++;
 
-      // tie is "push" but doesn't increase pot; for next-step edge we care about chance to be correct (win), not just non-loss.
-      const pHigh = (higher + equal) ? higher / (lower + higher + equal) : 0;
-      const pLow = (lower + equal) ? lower / (lower + higher + equal) : 0;
-      const best = Math.max(pHigh, pLow);
-
-      acc += (n / winTotal) * best;
+      const bestNext = (rel.total > 0) ? Math.max(rel.higher, rel.lower) / rel.total : 0;
+      acc += (n / winTotal) * bestNext;
     }
     return acc;
   }
 
-  function monteCarloScoreFirstAction(dealerValue, firstAction, horizon, rollouts, mode, modPct, tieIsPush) {
-    // Simulates survival/pot growth starting with firstAction.
-    // Subsequent actions use greedy policy (best immediate pWin or EV).
-    const baseCounts = state.counts;
-    const basePotFactor = 1.0; // we work in multipliers relative to current pot
-    const m = (typeof modPct === "number" && modPct > 0 && modPct < 1) ? modPct : 0.25;
+  function decide(dealerValue) {
+    const rel = countsRelativeTo(dealerValue);
+    if (rel.total <= 0) return { rec: "HIGH", pHigh: 0, pLow: 0, pTie: 0, used: "fallback", rel };
 
-    function drawCard(counts) {
-      let total = 0;
-      for (let v = 2; v <= 14; v++) total += counts[v];
-      if (total <= 0) return null;
-      let r = Math.floor(Math.random() * total);
-      for (let v = 2; v <= 14; v++) {
-        const n = counts[v];
-        if (r < n) return v;
-        r -= n;
-      }
-      return null;
-    }
+    const pHigh = rel.higher / rel.total;
+    const pLow = rel.lower / rel.total;
+    const pTie = rel.equal / rel.total;
 
-    function bestGreedyAction(dVal, counts) {
-      let lower = 0, higher = 0, equal = counts[dVal] || 0, total = 0;
-      for (let v = 2; v <= 14; v++) {
-        const n = counts[v] || 0;
-        total += n;
-        if (v < dVal) lower += n;
-        else if (v > dVal) higher += n;
-      }
-      if (total <= 0) return "HIGH";
-      const pHighWin = higher / total;
-      const pLowWin = lower / total;
-      if (mode === "merit") return (pHighWin >= pLowWin) ? "HIGH" : "LOW";
-
-      // profit: same ordering unless you want to penalize ties; keep it simple EV
-      const pTie = equal / total;
-      const highEV = pHighWin * (1 + m) + (tieIsPush ? pTie : 0);
-      const lowEV  = pLowWin  * (1 + m) + (tieIsPush ? pTie : 0);
-      return (highEV >= lowEV) ? "HIGH" : "LOW";
-    }
-
-    let sum = 0;
-    for (let i = 0; i < rollouts; i++) {
-      const counts = new Uint8Array(baseCounts); // copy
-      let potFactor = basePotFactor;
-      let d = dealerValue;
-
-      // remove current dealer from counts only if it still exists (we track it separately in real game)
-      // In real tracking, dealer card is already consumed when revealed. Here we assume it's already consumed.
-      // So do nothing.
-
-      let alive = true;
-      for (let step = 0; step < horizon; step++) {
-        const act = (step === 0) ? firstAction : bestGreedyAction(d, counts);
-
-        const next = drawCard(counts);
-        if (next == null) { break; }
-        counts[next]--;
-
-        if (next === d) {
-          // tie
-          if (!tieIsPush) { alive = false; potFactor = 0; break; }
-          // push: pot unchanged, dealer becomes that card
-          d = next;
-          continue;
-        }
-
-        const win = (act === "HIGH") ? (next > d) : (next < d);
-        if (win) {
-          potFactor *= (1 + m);
-          d = next;
-        } else {
-          alive = false;
-          potFactor = 0;
-          break;
-        }
-      }
-
-      // merit objective = survival probability; profit objective = expected pot factor
-      sum += (mode === "merit") ? (alive ? 1 : 0) : potFactor;
-    }
-    return sum / rollouts;
-  }
-
-  function decide(dealerValue, modPct) {
-    const { lower, higher, equal, total } = countsRelativeTo(dealerValue);
-    if (total <= 0) return { rec: "HIGH", pHigh: 0, pLow: 0, pTie: 0, edge: 0, used: "fallback" };
-
-    const pHigh = higher / total;
-    const pLow = lower / total;
-    const pTie = equal / total;
-
-    // Base recommendation (max pWin)
     let rec = (pHigh > pLow) ? "HIGH" : (pLow > pHigh) ? "LOW" : "TIE";
-
-    // Tie-breaker
     let used = "max-pWin";
+
     if (rec === "TIE") {
       if (settings.lookaheadTieBreaker) {
-        rec = oneStepLookaheadBestAction(dealerValue);
+        const eHigh = expectedNextEdgeIfWin(dealerValue, true);
+        const eLow = expectedNextEdgeIfWin(dealerValue, false);
+        rec = (eHigh >= eLow) ? "HIGH" : "LOW";
         used = "lookahead";
       } else {
         rec = (dealerValue <= 8) ? "HIGH" : "LOW";
@@ -319,17 +265,7 @@
       }
     }
 
-    // Optional Monte Carlo for close calls
-    const edge = Math.abs(pHigh - pLow);
-    if (settings.monteCarloEnabled && edge < settings.mcTriggerEdge) {
-      const tieIsPush = !!state.tieIsPush;
-      const sHigh = monteCarloScoreFirstAction(dealerValue, "HIGH", settings.mcHorizon, settings.mcRollouts, settings.mode, modPct, tieIsPush);
-      const sLow  = monteCarloScoreFirstAction(dealerValue, "LOW",  settings.mcHorizon, settings.mcRollouts, settings.mode, modPct, tieIsPush);
-      rec = (sHigh >= sLow) ? "HIGH" : "LOW";
-      used = `MC(${settings.mcRollouts}x,h${settings.mcHorizon})`;
-    }
-
-    return { rec, pHigh, pLow, pTie, edge, used };
+    return { rec, pHigh, pLow, pTie, used, rel };
   }
 
   /********************
@@ -347,84 +283,66 @@
     "border-radius:12px",
     "padding:10px 12px",
     "font:12px/1.35 system-ui, -apple-system, Segoe UI, Roboto, Arial",
-    "max-width:360px",
+    "max-width:380px",
     `transform:scale(${settings.overlayScale})`,
     "transform-origin:bottom right",
     "display:none",
   ].join(";");
   document.body.appendChild(overlay);
 
-  function pct(x) { return (x * 100).toFixed(1) + "%"; }
+  let toastMsg = "";
   function flash(msg) {
-    // quick toast inside overlay
-    state.toast = msg;
-    setTimeout(() => { if (state.toast === msg) { state.toast = ""; renderOverlay(null); } }, 2200);
-    renderOverlay(null);
+    toastMsg = msg;
+    renderOverlay(lastDecisionModel);
+    setTimeout(() => { if (toastMsg === msg) { toastMsg = ""; renderOverlay(lastDecisionModel); } }, 2200);
   }
+  function pct(x) { return (x * 100).toFixed(1) + "%"; }
+  function esc(s) { return String(s).replace(/[&<>"']/g, c => ({ "&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#039;" }[c])); }
 
   function renderOverlay(model) {
-    if (!settings.overlayEnabled) {
-      overlay.style.display = "none";
-      return;
-    }
+    if (!settings.overlayEnabled) { overlay.style.display = "none"; return; }
     overlay.style.display = "block";
-
-    const deckStatus = state.deckKnown ? "KNOWN" : "UNKNOWN";
-    const tieMode = state.tieIsPush ? "PUSH" : "LOSS?";
-    const toast = state.toast ? `<div style="margin-top:6px;color:#9bd1ff;">${escapeHtml(state.toast)}</div>` : "";
 
     const header = `
       <div style="display:flex;justify-content:space-between;gap:10px;align-items:baseline;">
-        <div><b>High-Low Brain</b> <span style="opacity:.7">v3.1.0</span></div>
+        <div><b>High-Low Brain</b> <span style="opacity:.7">v3.1.2</span></div>
         <div style="opacity:.7">${settings.mode.toUpperCase()}</div>
       </div>
-      <div style="opacity:.75">Deck: ${deckStatus} | Cards since shuffle: ${state.cardsSeen}/${settings.cardLimit} | Tie: ${tieMode}</div>
-      <div style="opacity:.75">Hotkeys: Alt+O overlay | Alt+H hide | Alt+R reset | Alt+M mode</div>
+      <div style="opacity:.75">Deck: ${state.deckKnown ? "KNOWN" : "UNKNOWN"} | Cards since reset: ${state.cardsSeen}/${settings.cardLimit}</div>
+      <div style="opacity:.75">Hotkeys: Alt+O overlay | Alt+H hide | Alt+R reset | Alt+M mode | Alt+L loss-reset</div>
     `;
+
+    const toast = toastMsg ? `<div style="margin-top:6px;color:#9bd1ff;">${esc(toastMsg)}</div>` : "";
 
     if (!model) {
       overlay.innerHTML = header + toast;
       return;
     }
 
-    const { dealerRank, lower, higher, equal, total, pHigh, pLow, pTie, rec, used, modPct, pot, profitHint } = model;
-
     overlay.innerHTML = header + `
       <hr style="border:none;border-top:1px solid rgba(255,255,255,0.1);margin:8px 0;">
-      <div><b>Dealer:</b> ${dealerRank}</div>
-      <div style="opacity:.85">Remaining: lower ${lower} | higher ${higher} | equal ${equal} | total ${total}</div>
+      <div><b>Dealer:</b> ${esc(model.dealerRank)}</div>
+      <div style="opacity:.85">Remaining: lower ${model.rel.lower} | higher ${model.rel.higher} | equal ${model.rel.equal} | total ${model.rel.total}</div>
 
       <div style="margin-top:6px;">
-        <div><b>P(win if HIGH):</b> ${pct(pHigh)}</div>
-        <div><b>P(win if LOW):</b> ${pct(pLow)}</div>
-        <div><b>P(tie):</b> ${pct(pTie)} (no pot increase)</div>
+        <div><b>P(win if HIGH):</b> ${pct(model.pHigh)}</div>
+        <div><b>P(win if LOW):</b> ${pct(model.pLow)}</div>
+        <div><b>P(tie):</b> ${pct(model.pTie)}</div>
       </div>
 
       <div style="margin-top:6px;">
-        <div><b>Recommend:</b> <span style="color:#9bd1ff">${rec}</span> <span style="opacity:.7">(${used})</span></div>
-        <div style="opacity:.8">Most likely next: ${topRanks(null, 3) || "n/a"}</div>
-        <div style="opacity:.8">If HIGH wins: ${topRanks(v => v > CARD_VALUES[dealerRank], 3) || "n/a"}</div>
-        <div style="opacity:.8">If LOW wins: ${topRanks(v => v < CARD_VALUES[dealerRank], 3) || "n/a"}</div>
-      </div>
-
-      <div style="margin-top:6px;opacity:.85">
-        <div><b>Modifier:</b> ${modPct != null ? pct(modPct) : "n/a"} | <b>Pot:</b> ${pot != null ? "$" + pot.toLocaleString() : "n/a"}</div>
-        ${profitHint ? `<div><b>Profit hint:</b> ${profitHint}</div>` : ""}
+        <div><b>Pick:</b> <span style="color:#9bd1ff">${esc(model.rec)}</span> <span style="opacity:.7">(${esc(model.used)})</span></div>
+        ${model.domNote ? `<div style="opacity:.8">${esc(model.domNote)}</div>` : ""}
       </div>
 
       ${toast}
     `;
   }
 
-  function escapeHtml(s) {
-    return String(s).replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;", "'": "&#039;" }[c]));
-  }
-
   /********************
-   * Game loop (DOM observation)
+   * Update loop
    ********************/
   let rafPending = false;
-
   function scheduleUpdate() {
     if (rafPending) return;
     rafPending = true;
@@ -436,173 +354,105 @@
 
   function detectShuffleText(container) {
     if (!settings.autoResetOnShuffleText) return false;
-
-    const candidates = [
-      $(".game-result-wrap", container),
-      container,
-      document.body
-    ].filter(Boolean);
-
-    for (const node of candidates) {
-      const t = (node.textContent || "").toLowerCase();
-      if (t.includes("deck") && (t.includes("shuffle") || t.includes("reshuffle") || t.includes("shuffled") || t.includes("reshuffled"))) {
-        return true;
-      }
-    }
-    return false;
+    const t = (container.textContent || "").toLowerCase();
+    return (t.includes("deck") && (t.includes("shuffle") || t.includes("shuffled") || t.includes("reshuffle") || t.includes("reshuffled")));
   }
 
   function detectLoss(container) {
-    const result = $(".game-result-wrap", container);
-    const t = (result?.textContent || "").toLowerCase();
-    if (!t) return false;
-    if (t.includes("lost") || t.includes("lose") || t.includes("incorrect")) return true;
-    return false;
-  }
-
-  function updateTieModeOnReveal(dealerValue, playerValue, container) {
-    if (dealerValue == null || playerValue == null) return;
-    if (dealerValue !== playerValue) return;
-
-    // Tie observed. Determine whether it's a push by watching for end-state signals.
-    // If the game immediately ends or pot resets, treat as not-push.
-    const { pot } = readPotAndModifier(container);
-
-    // If loss screen shows up after tie, it's not a push.
-    const tieLooksLikeLoss = detectLoss(container);
-
-    if (tieLooksLikeLoss) {
-      state.tieIsPush = false;
-    } else {
-      // if pot remains same (or non-zero) and game continues, it is likely a push.
-      // (we keep the default of push).
-      state.tieIsPush = true;
-    }
-    saveState();
-  }
-
-  function profitStopHint(pWin, pTie, modPct, pot) {
-    if (settings.mode !== "profit") return null;
-    if (pot == null || modPct == null) return null;
-
-    const m = modPct;
-    const tieIsPush = !!state.tieIsPush;
-
-    // EV if you play this hand (relative to current pot), assuming you pick the best side:
-    // EV = pWin*(1+m) + pTie*(tieIsPush?1:0)
-    const evFactor = (pWin * (1 + m)) + (tieIsPush ? pTie : 0);
-
-    // Torn: cash out after seeing dealer gives 50% pot.
-    const halfCash = 0.5;
-
-    // if EV is below half cash, suggest taking half rather than playing the hand.
-    if (evFactor < halfCash) return `EV ${evFactor.toFixed(3)}x < 0.500x, consider HALF-CASH`;
-    return `EV ${evFactor.toFixed(3)}x vs 0.500x half-cash`;
+    const wrap = $(".game-result-wrap", container);
+    const t = (wrap?.textContent || "").toLowerCase();
+    return (t.includes("lost") || t.includes("lose") || t.includes("incorrect"));
   }
 
   function updateOnce() {
     const container = $(".highlow-main-wrap");
-    if (!container) return;
+    if (!container) { renderOverlay(lastDecisionModel); return; }
 
-    // Auto reset: shuffle text
     if (detectShuffleText(container)) {
       resetDeck("shuffle-text");
       return;
     }
 
-    // Auto reset: card limit
     if (settings.autoResetOnCardLimit && state.cardsSeen >= settings.cardLimit) {
-      // When we hit the known reshuffle threshold, reset so the next card is treated as fresh-shoe.
       resetDeck(`card-limit(${settings.cardLimit})`);
-      // continue; (still render)
+      // continue (still compute)
     }
 
-    const dealerEl = $(".dealer-card span.rating", container);
-    const playerEl = $(".you-card span.rating", container);
-    const lowBtnWrap = $(".actions-wrap .action-btn-wrap.low", container);
-    const highBtnWrap = $(".actions-wrap .action-btn-wrap.high", container);
+    const dealerCardEl = $(".dealer-card", container);
+    const playerCardEl = $(".you-card", container);
+    if (!dealerCardEl || !playerCardEl) { renderOverlay(lastDecisionModel); return; }
 
-    if (!dealerEl || !playerEl || !lowBtnWrap || !highBtnWrap) {
-      renderOverlay(null);
-      return;
-    }
-
-    const dealerText = (dealerEl.textContent || "").trim();
-    const playerText = (playerEl.textContent || "").trim();
+    const dealerText = getCardTextFromCardEl(dealerCardEl);
+    const playerText = getCardTextFromCardEl(playerCardEl);
 
     const dealerValue = getCardValueFromText(dealerText);
     const playerValue = getCardValueFromText(playerText);
 
-    // Track dealer changes
+    // Always try to locate action buttons, but never require them to compute probabilities
+    const btns = findHighLowButtons(container);
+    const domNote = (!btns.low || !btns.high) ? "Note: could not detect Lower/Higher nodes (overlay still computed)" : "";
+
+    // Track dealer reveal
     if (dealerValue != null && dealerValue !== state.lastDealer) {
-      // Consume dealer card once per change
       consumeCard(dealerValue);
       state.lastDealer = dealerValue;
-      state.lastPlayer = null; // reset player tracking for this round
+      state.lastPlayer = null;
       saveState();
     }
 
-    // Player revealed
+    // Track player reveal (results screen)
     if (playerValue != null && playerValue !== state.lastPlayer) {
       consumeCard(playerValue);
-      updateTieModeOnReveal(state.lastDealer, playerValue, container);
       state.lastPlayer = playerValue;
       saveState();
 
-      // On reveal, hide buttons (choice already made)
-      lowBtnWrap.style.display = "none";
-      highBtnWrap.style.display = "none";
-
-      // Loss handling: do NOT reset deck by default (deck persists across games)
-      if (settings.resetOnLoss && detectLoss(container)) {
+      if (settings.autoResetOnLoss && detectLoss(container)) {
         resetDeck("loss");
       }
-      renderOverlay(null);
+
+      renderOverlay(lastDecisionModel);
       return;
     }
 
-    // Decision point: player hidden, dealer shown
-    if (dealerValue != null && playerText === "") {
-      const { pot, mod } = readPotAndModifier(container);
-      const rel = countsRelativeTo(dealerValue);
-      const d = decide(dealerValue, mod);
+    // Decision point: dealer known, player hidden (playerValue null)
+    if (dealerValue != null && playerValue == null) {
+      const d = decide(dealerValue);
 
-      // Hide-worst UX
-      if (settings.hideWorstEnabled) {
+      // Save + show model
+      lastDecisionModel = {
+        dealerRank: dealerText.toUpperCase(),
+        pHigh: d.pHigh,
+        pLow: d.pLow,
+        pTie: d.pTie,
+        rec: d.rec,
+        used: d.used,
+        rel: d.rel,
+        domNote,
+      };
+      renderOverlay(lastDecisionModel);
+
+      // Hide-worst only if we found buttons
+      if (settings.hideWorstEnabled && btns.low && btns.high) {
         if (d.rec === "HIGH") {
-          lowBtnWrap.style.display = "none";
-          highBtnWrap.style.display = "";
+          btns.low.style.display = "none";
+          btns.high.style.display = "";
         } else if (d.rec === "LOW") {
-          highBtnWrap.style.display = "none";
-          lowBtnWrap.style.display = "";
+          btns.high.style.display = "none";
+          btns.low.style.display = "";
         } else {
-          // if somehow unresolved
-          lowBtnWrap.style.display = "";
-          highBtnWrap.style.display = "";
+          btns.low.style.display = "";
+          btns.high.style.display = "";
         }
-      } else {
-        lowBtnWrap.style.display = "";
-        highBtnWrap.style.display = "";
+      } else if (btns.low && btns.high) {
+        btns.low.style.display = "";
+        btns.high.style.display = "";
       }
 
-      const bestPWin = Math.max(d.pHigh, d.pLow);
-      const profitHint = profitStopHint(bestPWin, d.pTie, mod, pot);
-
-      renderOverlay({
-        dealerRank: dealerText.toUpperCase(),
-        lower: rel.lower, higher: rel.higher, equal: rel.equal, total: rel.total,
-        pHigh: d.pHigh, pLow: d.pLow, pTie: d.pTie,
-        rec: d.rec, used: d.used,
-        modPct: mod, pot,
-        profitHint,
-      });
       return;
     }
 
-    // No dealer yet or between states
-    lowBtnWrap.style.display = "none";
-    highBtnWrap.style.display = "none";
-    renderOverlay(null);
+    // Otherwise: show last known decision if any
+    renderOverlay(lastDecisionModel);
   }
 
   /********************
@@ -610,13 +460,13 @@
    ********************/
   document.addEventListener("keydown", (e) => {
     if (!e.altKey) return;
-
     const k = (e.key || "").toLowerCase();
+
     if (k === "o") {
       settings.overlayEnabled = !settings.overlayEnabled;
       saveSettings();
       flash(`Overlay ${settings.overlayEnabled ? "ON" : "OFF"}`);
-      renderOverlay(null);
+      renderOverlay(lastDecisionModel);
     } else if (k === "h") {
       settings.hideWorstEnabled = !settings.hideWorstEnabled;
       saveSettings();
@@ -626,45 +476,29 @@
     } else if (k === "m") {
       settings.mode = (settings.mode === "profit") ? "merit" : "profit";
       saveSettings();
-      flash(`Mode: ${settings.mode.toUpperCase()}`);
+      flash(`Mode ${settings.mode.toUpperCase()}`);
+    } else if (k === "l") {
+      settings.autoResetOnLoss = !settings.autoResetOnLoss;
+      saveSettings();
+      flash(`Auto-reset on loss ${settings.autoResetOnLoss ? "ON" : "OFF"}`);
     }
   });
 
   /********************
    * Init
    ********************/
-  function waitForGame() {
-    const container = $(".highlow-main-wrap");
-    if (!container) return false;
-    return true;
-  }
-
-  function start() {
-    if (!state.counts || state.counts.length !== 15) {
-      state.counts = freshCounts();
-      state.deckKnown = false; // until first shuffle/reset
-      state.cardsSeen = 0;
-      state.tieIsPush = true;
-      saveState();
-    }
-
-    // MutationObserver for fast updates
+  const overlayBoot = setInterval(() => {
     const container = $(".highlow-main-wrap");
     if (!container) return;
+
+    clearInterval(overlayBoot);
 
     const obs = new MutationObserver(() => scheduleUpdate());
     obs.observe(container, { childList: true, subtree: true, characterData: true });
 
-    // Initial paint
+    // initial
     scheduleUpdate();
-    flash("Tracking loaded (Alt+R to reset if needed)");
-  }
-
-  const boot = setInterval(() => {
-    if (waitForGame()) {
-      clearInterval(boot);
-      start();
-    }
+    flash("Loaded. If odds missing: Alt+R reset.");
   }, 250);
 
   /********************
@@ -674,13 +508,11 @@
     try {
       const raw = localStorage.getItem(LS_SETTINGS);
       if (!raw) return { ...DEFAULTS };
-      const obj = JSON.parse(raw);
-      return { ...DEFAULTS, ...obj };
+      return { ...DEFAULTS, ...JSON.parse(raw) };
     } catch {
       return { ...DEFAULTS };
     }
   }
-
   function saveSettings() {
     try { localStorage.setItem(LS_SETTINGS, JSON.stringify(settings)); } catch {}
   }
@@ -696,9 +528,6 @@
           tieIsPush: true,
           lastDealer: null,
           lastPlayer: null,
-          lastPot: null,
-          lastOutcome: "",
-          toast: "",
         };
       }
       const obj = JSON.parse(raw);
@@ -712,12 +541,9 @@
         counts: c,
         cardsSeen: obj.cardsSeen || 0,
         deckKnown: !!obj.deckKnown,
-        tieIsPush: obj.tieIsPush !== false, // default true
+        tieIsPush: obj.tieIsPush !== false,
         lastDealer: obj.lastDealer ?? null,
         lastPlayer: obj.lastPlayer ?? null,
-        lastPot: obj.lastPot ?? null,
-        lastOutcome: obj.lastOutcome || "",
-        toast: "",
       };
     } catch {
       return {
@@ -727,25 +553,7 @@
         tieIsPush: true,
         lastDealer: null,
         lastPlayer: null,
-        lastPot: null,
-        lastOutcome: "",
-        toast: "",
       };
     }
-  }
-
-  function saveState() {
-    try {
-      localStorage.setItem(LS_STATE, JSON.stringify({
-        counts: Array.from(state.counts || []),
-        cardsSeen: state.cardsSeen || 0,
-        deckKnown: !!state.deckKnown,
-        tieIsPush: !!state.tieIsPush,
-        lastDealer: state.lastDealer,
-        lastPlayer: state.lastPlayer,
-        lastPot: state.lastPot,
-        lastOutcome: state.lastOutcome || "",
-      }));
-    } catch {}
   }
 })();
